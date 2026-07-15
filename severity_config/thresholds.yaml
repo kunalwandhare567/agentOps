@@ -1,0 +1,269 @@
+# ============================================================
+# severity_config/thresholds.yaml
+# Data-calibrated thresholds based on actual telemetry_metrics.csv
+# percentile analysis across 120,120 rows and 13 failure modes.
+# Edit here — no code changes needed.
+# ============================================================
+
+# ── Temporal smoothing ───────────────────────────────────────
+smoothing:
+  alpha: 0.30              # EMA weight on new raw severity (0=no change, 1=instant)
+  hysteresis_steps: 3      # consecutive lower readings required before de-escalating
+
+# ── High-risk feature categories ────────────────────────────
+# Features in this list trigger high_risk_mode=True when CRITICAL
+high_risk_features:
+  - cpu_utilization
+  - memory_utilization
+  - error_rate
+  - root_span_error_rate
+  - distinct_error_services
+
+# ── Per-feature thresholds ───────────────────────────────────
+# Calibrated from percentile analysis:
+#   Normal mode p75 → Warning threshold
+#   Failure mode p75 → Critical threshold
+# direction: "higher_worse" or "lower_worse"
+features:
+  # ── CPU / Compute ──────────────────────────────────────────
+  cpu_utilization:
+    warning_threshold: 55.0      # > Normal p75 = 38.4; fail modes reach 57–91
+    critical_threshold: 80.0     # CPU_SATURATION p75=90.7, CASCADING=86.0
+    direction: higher_worse
+
+  memory_utilization:
+    warning_threshold: 0.30      # Normal p75=0.272; CASCADING/RETRY go 0.35–0.39
+    critical_threshold: 0.37     # CASCADING p75=0.352, RETRY p75=0.288
+    direction: higher_worse
+
+  heap_mb:
+    warning_threshold: 550.0     # MEMORY_LEAK p75=548, RETRY p75=559
+    critical_threshold: 570.0    # RETRY p95=580; data max=769 in extreme cases
+    direction: higher_worse
+
+  gc_pause_p99:
+    warning_threshold: 50.0      # Normal p95=44.6; CASCADING/LATENCY_SPIKE hit 189+
+    critical_threshold: 100.0    # CASCADING p75=189, LATENCY_SPIKE p95=195
+    direction: higher_worse
+
+  # ── Latency ────────────────────────────────────────────────
+  p99_latency:
+    warning_threshold: 300.0     # Normal p75=130; DEPENDENCY/CASCADING reach 854+
+    critical_threshold: 700.0    # DEPENDENCY_TIMEOUT p75=854, CASCADING p75=1657
+    direction: higher_worse
+
+  p95_latency:
+    warning_threshold: 200.0
+    critical_threshold: 500.0
+    direction: higher_worse
+
+  p50_latency:
+    warning_threshold: 120.0
+    critical_threshold: 200.0
+    direction: higher_worse
+
+  db_p99:
+    warning_threshold: 100.0     # CACHE_STAMPEDE p75=87, DB_SLOWDOWN p75=241
+    critical_threshold: 200.0    # DB_SLOWDOWN p75=241, CASCADING p75=518
+    direction: higher_worse
+
+  disk_write_latency:
+    warning_threshold: 80.0      # DISK_IO_SATURATION p75=143
+    critical_threshold: 130.0    # DISK_IO_SATURATION p95=212, CASCADING p75=179
+    direction: higher_worse
+
+  disk_read_latency:
+    warning_threshold: 60.0      # DISK_IO_SATURATION mean=97
+    critical_threshold: 100.0    # DISK_IO_SATURATION p75=117
+    direction: higher_worse
+
+  # ── Error Rates ────────────────────────────────────────────
+  error_rate:
+    warning_threshold: 0.05      # Normal 5th pct; CPU_SATURATION p75=0.053
+    critical_threshold: 0.20     # ERROR_STORM p75=0.47, BAD_DEPLOY p75=0.67
+    direction: higher_worse
+
+  upstream_timeout_rate:
+    warning_threshold: 0.05      # DEPENDENCY_TIMEOUT=0.55 constant
+    critical_threshold: 0.20     # CASCADING p75=0.21
+    direction: higher_worse
+
+  # ── Cache ──────────────────────────────────────────────────
+  cache_miss_rate:
+    warning_threshold: 0.15      # Normal p95=0.12; CACHE_STAMPEDE=0.96!
+    critical_threshold: 0.50     # CACHE_STAMPEDE p75=0.957
+    direction: higher_worse
+
+  cache_hit_rate:
+    warning_threshold: 0.85      # WARNING if BELOW 0.85 (CACHE_STAMPEDE: 0.10)
+    critical_threshold: 0.50     # CRITICAL if BELOW 0.50 (CACHE_STAMPEDE p75=0.104)
+    direction: lower_worse
+
+  # ── Queue / Threads ────────────────────────────────────────
+  queue_lag:
+    warning_threshold: 30.0      # CPU_SATURATION p75=58; CASCADING p75=258
+    critical_threshold: 100.0    # QUEUE_BACKUP p75=336, CASCADING p75=258
+    direction: higher_worse
+
+  thread_pool_queue:
+    warning_threshold: 20.0      # ERROR_STORM p75=22; CPU_SATURATION p75=144
+    critical_threshold: 50.0     # CACHE_STAMPEDE p75=56, CPU_SATURATION p75=144
+    direction: higher_worse
+
+  # ── Network / Connections ──────────────────────────────────
+  network_errors:
+    warning_threshold: 2.0
+    critical_threshold: 10.0
+    direction: higher_worse
+
+  retry_count_per_request:
+    warning_threshold: 0.10      # Normal p95=0.10; RETRY_STORM p75=0.755
+    critical_threshold: 0.30     # CASCADING p75=0.426, RETRY_STORM p75=0.755
+    direction: higher_worse
+
+  active_connections:
+    warning_threshold: 150.0
+    critical_threshold: 225.0
+    direction: higher_worse
+
+  db_connection_pool:
+    warning_threshold: 0.75
+    critical_threshold: 0.95
+    direction: higher_worse
+
+  circuit_breaker_state:
+    warning_threshold: 1          # half-open
+    critical_threshold: 2         # open
+    direction: higher_worse
+
+  # ── Derived features ──────────────────────────────────────
+  p99_minus_p50_ratio:
+    warning_threshold: 3.0        # p99 > 3x p50
+    critical_threshold: 8.0       # p99 > 8x p50
+    direction: higher_worse
+
+  heap_growth_rate:
+    warning_threshold: 5.0        # MB/cycle
+    critical_threshold: 15.0
+    direction: higher_worse
+
+  write_read_latency_ratio:
+    warning_threshold: 2.0        # Relaxed: data shows write/read ~1.2x typically
+    critical_threshold: 5.0
+    direction: higher_worse
+
+  # ── Log features ──────────────────────────────────────────
+  log_max_severity:
+    warning_threshold: 2          # WARNING level
+    critical_threshold: 4         # CRITICAL level
+    direction: higher_worse
+
+  log_critical_count:
+    warning_threshold: 0          # any CRITICAL log → warning
+    critical_threshold: 2         # >2 CRITICAL logs → critical
+    direction: higher_worse
+
+  log_has_exception:
+    warning_threshold: 1          # presence → WARNING only (binary)
+    critical_threshold: 999       # never critical on its own
+    direction: higher_worse
+
+  # ── Trace features ────────────────────────────────────────
+  root_span_error_rate:
+    warning_threshold: 0.10       # >10%
+    critical_threshold: 0.40      # >40%
+    direction: higher_worse
+
+  span_gap_ratio:
+    warning_threshold: 0.30
+    critical_threshold: 0.60
+    direction: higher_worse
+
+  uniform_slowdown_score:
+    warning_threshold: 0.50
+    critical_threshold: 0.80
+    direction: higher_worse
+
+  duplicate_trace_id_count:
+    warning_threshold: 3.0
+    critical_threshold: 10.0
+    direction: higher_worse
+
+  distinct_error_services:
+    warning_threshold: 1.0        # >1 service
+    critical_threshold: 2.0       # >2 services
+    direction: higher_worse
+
+# ── Failure-mode weight overrides ───────────────────────────
+# Multipliers applied before aggregation; weight >= 1.5 escalates WARNING → CRITICAL
+failure_mode_weights:
+  CPU_SATURATION:
+    cpu_utilization: 1.5
+    thread_pool_queue: 1.3
+    uniform_slowdown_score: 1.3
+
+  MEMORY_LEAK:
+    heap_mb: 1.5
+    gc_pause_p99: 1.3
+    heap_growth_rate: 1.5
+    span_gap_ratio: 1.2
+
+  LATENCY_SPIKE:
+    p99_latency: 1.5
+    p99_minus_p50_ratio: 1.5
+    p95_latency: 1.2
+
+  RETRY_STORM:
+    error_rate: 1.4
+    queue_lag: 1.4
+    retry_count_per_request: 1.5
+    duplicate_trace_id_count: 1.3
+
+  CACHE_STAMPEDE:
+    cache_miss_rate: 1.5
+    cache_hit_rate: 1.5
+    thread_pool_queue: 1.2
+
+  DB_SLOWDOWN:
+    db_p99: 1.5
+    queue_lag: 1.3
+    db_connection_pool: 1.3
+
+  CASCADING_FAILURE:
+    distinct_error_services: 2.0
+    root_span_error_rate: 1.5
+    error_rate: 1.3
+
+  DEPENDENCY_TIMEOUT:
+    upstream_timeout_rate: 1.5
+    circuit_breaker_state: 1.5
+
+  DISK_IO_SATURATION:
+    disk_write_latency: 1.5
+    write_read_latency_ratio: 1.5
+    disk_read_latency: 1.3
+
+  NETWORK_CONGESTION:
+    network_errors: 1.5
+    p99_latency: 1.2
+
+  ERROR_STORM:
+    error_rate: 1.5
+    upstream_timeout_rate: 1.3
+
+  BAD_DEPLOY:
+    error_rate: 1.3
+    upstream_timeout_rate: 1.4
+    # Minimum severity floor for BAD_DEPLOY is P2 (enforced in rules.py)
+    min_severity: "P2"
+
+  QUEUE_BACKUP:
+    queue_lag: 1.5
+    thread_pool_queue: 1.3
+
+# ── Severity score-to-label (for logging/explanation only) ──
+score_bands:
+  P1_min_score: 12
+  P2_min_score: 6
+  P3_min_score: 3
+  P4_min_score: 0
