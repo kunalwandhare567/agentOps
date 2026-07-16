@@ -1,0 +1,100 @@
+# Implementation Plan — Telemetry Pipeline, HMM State Sequencing & Time-Series Forecasting
+
+This plan outlines the design and implementation of the complete telemetry diagnostic pipeline based on the specifications in [Telemetry Pipeline Plan.pdf](file:///d:/DEVOPS/files/Telemetry%20Pipeline%20Plan.pdf).
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Key Pipeline Configurations & Design Decisions:**
+> 1. **Data Joining & Alignment**: 
+>    - We will merge metrics, logs, and traces on `(episode_id, elapsed_s, timestamp)`. 
+>    - Since traces are generated every 4 steps (8 seconds) in the generator, we will aggregate trace-level features per step and forward-fill/fill-zero for steps without trace entries to ensure complete coverage.
+> 2. **HMM Parameter Estimation**:
+>    - We will define the "true" transition state sequence for the training episodes based on the transition timeline (healthy in the first 80s, failure state in the middle, and crash/recovery in the end).
+>    - We will estimate the Transition Matrix $A$ and Emission Matrix $B$ (representing classifier confusion) directly from the training set, then run the Viterbi algorithm natively to find the most probable hidden state sequence for each test episode.
+> 3. **Tumbling Mode**:
+>    - We will tumble the step-level predictions into 60-second windows (30 steps each) using the mode of each window. For 240-second episodes, this will produce 4 windows (`t1` to `t4`). To match the template's 5-row layout, we will also output a 48s-window version (5 windows of 24 steps each) as `HMM_Test_Data_State_Sequence_With_Tumbling_Mode_5win.xlsx` to prevent any structural divergence.
+> 4. **ARIMA Metric Forecasting**:
+>    - We will fit ARIMA models on 9 key metrics: CPU Utilization, Memory Utilization, P50 Latency, P95 Latency, P99 Latency, Error Rate, Request Rate, Cache Hit Rate, and Queue Lag.
+>    - The models will be trained on the first 90 steps (180 seconds) and forecast the remaining 30 steps (60 seconds) to evaluate MAE, RMSE, and MAPE.
+
+> [!WARNING]
+> **Package Installations Needed:**
+> - `statsmodels` (for ARIMA forecasting)
+> - `openpyxl` (for Excel read/write)
+
+---
+
+## Module-Wise Implementation Plan
+
+```mermaid
+graph TD
+    A[telemetry_metrics.csv] --> D[Merge & Align]
+    B[telemetry_logs.csv] --> D
+    C[telemetry_traces.csv] --> D
+    
+    D --> E[Step-Level Feature Engineering]
+    E --> F[Train Step Classifier]
+    F --> G[Predict Test Snapshot States]
+    
+    G --> H[HMM Transition & Emission Estimation]
+    H --> I[Viterbi State Sequence Smoothing]
+    
+    G --> J[Tumble to 60s Windows]
+    J --> K[Export Excel/CSV Tumbling Mode]
+    I --> L[Export HMM-Smoothed Excel/CSV]
+    
+    D --> M[ARIMA Time-Series Forecasting]
+    M --> N[Forecast 30 steps & Evaluate MAE/RMSE/MAPE]
+```
+
+### Module 1: Step-Level Data Preparation & Feature Engineering
+**Files to Modify/Create:** [generate_hmm_states.py](file:///d:/DEVOPS/generate_hmm_states.py)
+- Load `telemetry_metrics.csv`, `telemetry_logs.csv`, and `telemetry_traces.csv`.
+- Aggregate trace data per `(episode_id, elapsed_s)`:
+  - `root_span_error_rate`: Fraction of root spans with error status.
+  - `span_gap_ratio`: `(root_duration - sum(child_duration)) / root_duration`.
+  - `uniform_slowdown_score`: Min/max child span duration ratio.
+  - `duplicate_trace_id_count`: Count of duplicated `trace_id` values.
+  - `distinct_error_services`: Count of unique service names with span errors.
+- Extract log features per step (max severity, critical count, has exception, exception type).
+- Merge metrics, logs, and traces into a single step-level dataset (120,120 rows).
+
+### Module 2: Step-Level Classification & HMM Smoothing
+**Files to Create:** [generate_hmm_states.py](file:///d:/DEVOPS/generate_hmm_states.py)
+- Split episodes into 80% train and 20% test using stratified split with seed 42.
+- Train a step-level Random Forest / XGBoost classifier on the training steps.
+- Predict the state for every step in the test set.
+- Estimate the HMM transition probabilities (by counting state transitions in training episodes) and emission probabilities (from the classifier confusion matrix on training data).
+- Run the native **Viterbi algorithm** to smooth the classifier's predictions for each test episode.
+- Export results:
+  - Detailed state sequences: `data/HMM_Test_Data_State_Sequence.xlsx`
+  - Tumbling mode (60s window): `data/HMM_Test_Data_State_Sequence_With_Tumbling_Mode.xlsx` (and CSV)
+  - HMM-smoothed sequences: `data/HMM_Test_Data_State_Sequence_Smoothed.xlsx`
+  - HMM transition & emission matrices.
+
+### Module 3: Time-Series Forecasting
+**Files to Create:** [forecast_metrics.py](file:///d:/DEVOPS/forecast_metrics.py)
+- Select the 9 key metrics across all test episodes.
+- Train ARIMA models on the first 90 steps (180s) of each time series.
+- Forecast the next 30 steps and evaluate metrics against actuals using MAE, RMSE, and MAPE.
+- Save forecasting metrics and plots to `data/forecasting_evaluation.json` and `data/forecasting_plot.png`.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- Run validation suite:
+  ```powershell
+  python generate_hmm_states.py
+  python forecast_metrics.py
+  ```
+- Check outputs under `data/`:
+  - `HMM_Test_Data_State_Sequence.xlsx`
+  - `HMM_Test_Data_State_Sequence_With_Tumbling_Mode.xlsx`
+  - `HMM_Test_Data_State_Sequence_Smoothed.xlsx`
+  - `forecasting_plot.png`
+  - `forecasting_evaluation.json`

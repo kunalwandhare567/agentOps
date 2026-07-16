@@ -1,0 +1,281 @@
+# Implementation Plan — AI-Powered Incident Intelligence Platform
+## Severity Engine (Module-Wise Deep Plan)
+
+> This plan is scoped to the **Severity Engine** only.  
+> HMM/Tumbling Mode is already done. Forecasting is deferred.  
+> Every design decision below is calibrated from your actual telemetry data ranges and your Severity Detection Features document.
+
+---
+
+## Architecture Overview
+
+```mermaid
+graph TD
+    A["Telemetry Row (metrics + logs + traces)"] --> B["Feature Engineering<br/>40–50 engineered features"]
+    B --> C["XGBoost Classifier<br/>(already built in data_pipeline.py)"]
+    C --> D["Failure Mode (13 classes)"]
+    D --> E["Severity Engine"]
+    B --> E
+    E --> E1["indicators.py — per-feature level eval"]
+    E1 --> E2["aggregator.py — count criticals/warnings"]
+    E2 --> E3["rules.py — 6-rule decision tree → P1/P2/P3/P4"]
+    E3 --> E4["smoother.py — temporal smoothing"]
+    E4 --> F["SeverityResult object"]
+    F --> G["LangGraph Node Interface"]
+    G --> H["Incident Intelligence / LLM Explanation"]
+```
+
+---
+
+## Project File Structure
+
+```
+d:\DEVOPS\
+├── severity_engine\
+│   ├── __init__.py
+│   ├── config.py            ← YAML-driven config loader
+│   ├── thresholds.py        ← Warning / Critical thresholds per feature (calibrated to data)
+│   ├── indicators.py        ← IndicatorLevel enum + per-feature rule functions
+│   ├── aggregator.py        ← Counts critical/warning, blast_size, high_risk_mode
+│   ├── rules.py             ← 6-rule severity decision engine (from your document)
+│   ├── smoother.py          ← Temporal smoothing (EMA + hysteresis)
+│   ├── severity_engine.py   ← Orchestrator: row → SeverityResult
+│   └── utils.py             ← SeverityResult dataclass, helpers, logging
+├── severity_config\
+│   └── thresholds.yaml      ← All thresholds externalized; tweak without code change
+├── tests\
+│   ├── test_indicators.py
+│   ├── test_aggregator.py
+│   ├── test_rules.py
+│   ├── test_smoother.py
+│   └── test_severity_engine.py
+├── docs\
+│   ├── architecture.md
+│   ├── severity_rules.md
+│   └── diagrams\
+│       ├── flow_diagram.md     ← Mermaid flowchart
+│       └── class_diagram.md    ← Mermaid class diagram
+├── notebooks\
+│   └── severity_demo.ipynb
+└── generate_hmm_states.py   ← (already exists)
+```
+
+---
+
+## Module 1 — `thresholds.py` (Data-Calibrated)
+
+All thresholds are derived from your **Severity Detection Features** document, cross-validated against the **actual data ranges** observed in `telemetry_metrics.csv`.
+
+> [!IMPORTANT]
+> Thresholds below are calibrated to **your data** (not the generic examples in the prompt).  
+> Raw data ranges: cpu max=100, heap max=769MB, p99 max=2036ms, db_p99 max=1517ms, error_rate max=85%, queue_lag max=457.
+
+| Feature | Normal (no flag) | Warning Threshold | Critical Threshold | Data Basis |
+|---|---|---|---|---|
+| `cpu_utilization` | < 70% | ≥ 70% | ≥ 90% | Max=100, 75th pct=51.8 |
+| `memory_utilization` | < 0.75 | ≥ 0.75 | ≥ 0.90 | Max=0.44, scaled to fraction |
+| `heap_mb` | < 2470 MB (65%) | ≥ 2470 MB | ≥ 3420 MB (90%) | Configured max=3800MB per generator |
+| `gc_pause_p99` | < 100 ms | ≥ 100 ms | ≥ 400 ms | Max=650, 75th=26.9 |
+| `p99_latency` | < 500 ms | ≥ 500 ms | ≥ 2000 ms | Max=2036, mean=365 |
+| `p95_latency` | < 300 ms | ≥ 300 ms | ≥ 1200 ms | Max=1932 |
+| `db_p99` | < 200 ms | ≥ 200 ms | ≥ 1000 ms | Max=1517, mean=95 |
+| `disk_write_latency` | < 200 ms | ≥ 200 ms | ≥ 600 ms | Max=545 |
+| `disk_read_latency` | < 50 ms | ≥ 50 ms | ≥ 150 ms | Max=444 |
+| `error_rate` | < 5% | ≥ 5% | ≥ 20% | Max=85%, mean=17.9% |
+| `upstream_timeout_rate` | < 5% | ≥ 5% | ≥ 20% | Max=55% |
+| `cache_miss_rate` | < 30% | ≥ 30% | ≥ 80% | Max=99%, mean=13.4% |
+| `cache_hit_rate` | > 70% | ≤ 70% | ≤ 20% | **Lower = worse** |
+| `queue_lag` | < 100 | ≥ 100 | ≥ 300 | Max=457, mean=53.7 |
+| `thread_pool_queue` | < 15 | ≥ 15 | ≥ 40 | Max=514, mean=92 |
+| `network_errors` | < 2/window | ≥ 2 | ≥ 10 | Max=38 |
+| `retry_count_per_request` | < 1.5 | ≥ 1.5 | ≥ 3.0 | Max=0.9 (scaled 0–1 in data) |
+| `active_connections` | < 150 (60% of 250) | ≥ 150 | ≥ 225 (90%) | Max=414, pool=250 |
+| `db_connection_pool` | < 0.75 | ≥ 0.75 | ≥ 0.95 | Max=0.99 (fraction) |
+| `circuit_breaker_state` | 0 (closed) | 1 (half-open) | 2 (open) | Categorical |
+| `root_span_error_rate` | < 10% | ≥ 10% | ≥ 40% | Trace feature |
+| `span_gap_ratio` | < 0.3 | ≥ 0.3 | ≥ 0.6 | Trace feature |
+| `uniform_slowdown_score` | < 0.5 | ≥ 0.5 | ≥ 0.8 | Trace feature |
+| `duplicate_trace_id_count` | ≤ 3 | > 3 | > 10 | Trace feature |
+| `distinct_error_services` | ≤ 1 | > 1 | > 2 + growing | Trace feature |
+| `log_max_severity` | < 2 | ≥ 2 (WARNING) | ≥ 4 (CRITICAL) | Log feature |
+| `log_critical_count` | 0 | > 0 | > 2 | Log feature |
+| `log_has_exception` | 0 | 1 | — (binary, warning only) | Log feature |
+
+**Derived Features (computed inside engine):**
+- `p99_minus_p50_ratio` = `p99_latency / p50_latency` — Warning: > 3×, Critical: > 8×
+- `heap_growth_rate` = `heap_mb[t] - heap_mb[t-1]` — Warning: > 5 MB/cycle, Critical: > 20 MB/cycle
+- `write_read_latency_ratio` = `disk_write_latency / disk_read_latency` — Warning: > 5×, Critical: > 15×
+
+All thresholds are stored in `severity_config/thresholds.yaml` for easy modification.
+
+---
+
+## Module 2 — `indicators.py`
+
+```python
+class IndicatorLevel(Enum):
+    NORMAL   = 0
+    WARNING  = 1
+    HIGH     = 2
+    CRITICAL = 3
+```
+
+Each feature gets its own pure function `evaluate_<feature>(value, thresholds) → IndicatorLevel`.  
+Functions are **stateless** and **testable in isolation**.
+
+**High-risk feature categories** (per your document):
+- `cpu_utilization`, `memory_utilization`, `error_rate`, `root_span_error_rate`, `distinct_error_services`
+
+---
+
+## Module 3 — `aggregator.py`
+
+Consumes all indicator results and produces the **4 input variables** required by the 6-rule decision engine:
+
+| Variable | How Computed |
+|---|---|
+| `critical_count` | Count of features at `CRITICAL` level |
+| `warning_count` | Count of features at `WARNING` or `HIGH` (not CRITICAL) |
+| `high_risk_mode` | True if any CRITICAL feature belongs to the high-risk category |
+| `blast_size` | Count of all anomalous features (`WARNING` + `HIGH` + `CRITICAL`) |
+| `blast_radius_growing` | True if `distinct_error_services[t] > distinct_error_services[t-1]` |
+
+---
+
+## Module 4 — `rules.py`
+
+Implements the **exact 6-rule decision tree** from your Severity Detection Features document, evaluated **top-to-bottom, first match wins**:
+
+| Priority | Severity | Condition |
+|---|---|---|
+| 1 | **P1** | `critical_count >= 2` OR (`critical_count >= 1` AND `high_risk_mode = True`) |
+| 2 | **P1** | `blast_radius_growing = True` AND `critical_count >= 1` |
+| 3 | **P2** | `critical_count == 1` AND `high_risk_mode = False` |
+| 4 | **P2** | `warning_count >= 3` AND `high_risk_mode = True` |
+| 5 | **P3** | `warning_count >= 2` OR `blast_size >= 4` |
+| 6 | **P4** | `warning_count in [0,1]` AND `blast_size < 4` (default fallback) |
+
+**Failure-Mode Weights:** The aggregator applies per-mode weight multipliers **before** counting. Example:
+- `CPU_SATURATION`: `cpu_utilization` weight ×1.5, `thread_pool_queue` weight ×1.3
+- `MEMORY_LEAK`: `heap_mb` weight ×1.5, `gc_pause_p99` weight ×1.3, `heap_growth_rate` weight ×1.5
+- `BAD_DEPLOY`: minimum severity floor = P2 (regardless of rules)
+- `CASCADING_FAILURE`: `distinct_error_services` weight ×2.0
+
+---
+
+## Module 5 — `smoother.py`
+
+Implements **Exponential Moving Average (EMA) + Hysteresis** to prevent unrealistic severity jumps:
+
+- Severity is encoded numerically: `P4=1, P3=2, P2=3, P1=4`
+- EMA with configurable `alpha` (default 0.3): `smoothed = alpha * raw + (1 - alpha) * prev_smoothed`
+- **Hysteresis**: severity can only **escalate by 1 level per step** and can only **de-escalate after N consecutive lower readings** (default N=3).
+- Result: `P4 → P4 → P3 → P3 → P2 → P1` ✅ (never `P4 → P1` in one jump)
+
+---
+
+## Module 6 — `severity_engine.py` (Orchestrator)
+
+```python
+class SeverityEngine:
+    def evaluate_row(self, row: dict, failure_mode: str, prev_state: dict) -> SeverityResult
+    def compute_severity(self, df: pd.DataFrame) -> pd.DataFrame  # batch support
+```
+
+**Output `SeverityResult` dataclass** (per row):
+```python
+@dataclass
+class SeverityResult:
+    timestamp: str
+    episode_id: str
+    failure_mode: str
+    severity: str            # P1 / P2 / P3 / P4
+    weighted_score: float
+    critical_count: int
+    warning_count: int
+    blast_size: int
+    high_risk_mode: bool
+    blast_radius_growing: bool
+    indicator_breakdown: dict  # {feature: "NORMAL"/"WARNING"/"CRITICAL"...}
+    reason: str              # Human-readable explanation
+    recommended_action: str
+```
+
+---
+
+## Module 7 — `config.py` + `thresholds.yaml`
+
+All thresholds, weights, and smoothing parameters are externalized into `severity_config/thresholds.yaml`:
+```yaml
+smoothing:
+  alpha: 0.3
+  hysteresis_steps: 3
+
+failure_mode_weights:
+  CPU_SATURATION:
+    cpu_utilization: 1.5
+    thread_pool_queue: 1.3
+  MEMORY_LEAK:
+    heap_mb: 1.5
+    gc_pause_p99: 1.3
+  ...
+```
+
+---
+
+## Module 8 — LangGraph Node Interface
+
+```python
+class SeverityNode:
+    """Single LangGraph node. Input: AgentState. Output: AgentState with severity populated."""
+    def __call__(self, state: AgentState) -> AgentState
+```
+
+Designed to plug directly into LangGraph with a typed `AgentState` (per your `AgentState Pydantic Class.pdf`).
+
+---
+
+## Tests Plan (`tests/`)
+
+| Test File | Covers |
+|---|---|
+| `test_indicators.py` | All threshold boundaries (below/at/above warning and critical) |
+| `test_aggregator.py` | Correct `critical_count`, `warning_count`, `blast_size`, `high_risk_mode` |
+| `test_rules.py` | All 6 severity rules + edge cases (ties, BAD_DEPLOY floor) |
+| `test_smoother.py` | EMA convergence, hysteresis enforcement, no-jump constraint |
+| `test_severity_engine.py` | End-to-end row evaluation + batch `compute_severity(df)` |
+
+---
+
+## Documentation Plan (`docs/`)
+
+- `architecture.md` — System overview with Mermaid pipeline diagram
+- `severity_rules.md` — Full rule documentation with worked examples from your document
+- `diagrams/flow_diagram.md` — Step-by-step flowchart
+- `diagrams/class_diagram.md` — Mermaid class diagram for all modules
+
+---
+
+## Verification Plan
+
+### Automated Tests
+```powershell
+pytest tests/ -v --tb=short
+```
+
+### End-to-End Smoke Test
+```powershell
+python severity_engine/severity_engine.py
+```
+Using 5 reference scenarios from your document:
+- Early MEMORY_LEAK → expected P3
+- MEMORY_LEAK near OOM → expected P1
+- Isolated DB_SLOWDOWN → expected P2
+- CASCADING_FAILURE spreading → expected P1
+- Minor QUEUE_BACKUP → expected P4
+
+### Batch Test
+```powershell
+python -c "from severity_engine.severity_engine import SeverityEngine; ..."
+```
+Run `compute_severity(df)` on the full 120,120-row telemetry dataset and check the severity distribution is realistic (mostly P4/P3, some P2, few P1).
